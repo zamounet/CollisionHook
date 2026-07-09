@@ -1,11 +1,6 @@
 
 
 #include "extension.h"
-
-#include "sourcehook.h"
-#include "CDetour/detours.h"
-
-#include "vphysics_interface.h"
 #include "ihandleentity.h"
 
 #include "tier1/strtools.h"
@@ -13,49 +8,39 @@
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
+#include "vtable_hook_helper.h"
 
 
 
 CollisionHook g_CollisionHook;
 SMEXT_LINK( &g_CollisionHook );
 
-
-SH_DECL_HOOK0( IPhysics, CreateEnvironment, SH_NOATTRIB, 0 , IPhysicsEnvironment * );
-SH_DECL_HOOK1_void( IPhysicsEnvironment, SetCollisionSolver, SH_NOATTRIB, 0, IPhysicsCollisionSolver * );
-#if SOURCE_ENGINE == SE_LEFT4DEAD2
-SH_DECL_HOOK6( IPhysicsCollisionSolver, ShouldCollide, SH_NOATTRIB, 0, int, IPhysicsObject *, IPhysicsObject *, void *, void *, const PhysicsCollisionRulesCache_t &, const PhysicsCollisionRulesCache_t & );
-#else
-SH_DECL_HOOK4( IPhysicsCollisionSolver, ShouldCollide, SH_NOATTRIB, 0, int, IPhysicsObject *, IPhysicsObject *, void *, void * );
-#endif
-
-
 IGameConfig *g_pGameConf = NULL;
-CDetour *g_pFilterDetour = NULL;
-
 IPhysics *g_pPhysics = NULL;
 
 IForward *g_pCollisionFwd = NULL;
 IForward *g_pPassFwd = NULL;
 
-int gSetCollisionSolverHookId, gShouldCollideHookId;
+CVTableHook *g_SetCollisionSolverHook, *g_ShouldCollideHook;
 
+bool gPassServerEntityFilterDetoured;
 
-DETOUR_CUSTOM_STATIC2( PassServerEntityFilterFunc, bool, const IHandleEntity *, pTouch, const IHandleEntity *, pPass )
+KHook::Return<bool> PassServerEntityFilterFunc(const IHandleEntity *pTouch, const IHandleEntity *pPass)
 {
 	if ( g_pPassFwd->GetFunctionCount() == 0 )
-		return DETOUR_STATIC_CALL( PassServerEntityFilterFunc )( pTouch, pPass );
+		return { KHook::Action::Ignore, *(bool*)KHook::GetCurrentValuePtr() };
 
 	if ( pTouch == pPass )
-		return DETOUR_STATIC_CALL( PassServerEntityFilterFunc )( pTouch, pPass ); // self checks aren't interesting
+		return { KHook::Action::Ignore, *(bool*)KHook::GetCurrentValuePtr() }; // self checks aren't interesting
 
 	if ( !pTouch || !pPass )
-		return DETOUR_STATIC_CALL( PassServerEntityFilterFunc )( pTouch, pPass ); // need two valid entities
+		return { KHook::Action::Ignore, *(bool*)KHook::GetCurrentValuePtr() }; // need two valid entities
 
 	CBaseEntity *pEnt1 = const_cast<CBaseEntity *>( UTIL_EntityFromEntityHandle( pTouch ) );
 	CBaseEntity *pEnt2 = const_cast<CBaseEntity *>( UTIL_EntityFromEntityHandle( pPass ) );
 
 	if ( !pEnt1 || !pEnt2 )
-		return DETOUR_STATIC_CALL( PassServerEntityFilterFunc )( pTouch, pPass ); // we need both entities
+		return { KHook::Action::Ignore, *(bool*)KHook::GetCurrentValuePtr() }; // we need both entities
 
 	cell_t ent1 = gamehelpers->EntityToBCompatRef( pEnt1 );
 	cell_t ent2 = gamehelpers->EntityToBCompatRef( pEnt2 );
@@ -72,16 +57,24 @@ DETOUR_CUSTOM_STATIC2( PassServerEntityFilterFunc, bool, const IHandleEntity *, 
 	if ( retValue > Pl_Continue )
 	{
 		// plugin wants to change the result
-		return result == 1;
+		return { KHook::Action::Override, result == 1 };
 	}
-
+	
 	// otherwise, game decides
-	return DETOUR_STATIC_CALL( PassServerEntityFilterFunc )( pTouch, pPass );
+	return { KHook::Action::Ignore, *(bool*)KHook::GetCurrentValuePtr() };
+}
+
+KHook::Function<bool, const IHandleEntity*, const IHandleEntity*> g_PassServerEntityFilterFuncDetour(nullptr, PassServerEntityFilterFunc);
+
+CollisionHook::CollisionHook() : m_CreateEnvironment(&IPhysics::CreateEnvironment, this, nullptr, &CollisionHook::CreateEnvironment), m_SetCollisionSolver(&IPhysicsEnvironment::SetCollisionSolver, this, nullptr, &CollisionHook::SetCollisionSolver), m_VPhysics_ShouldCollide(&IPhysicsCollisionSolver::ShouldCollide, this, &CollisionHook::VPhysics_ShouldCollide, nullptr)
+{
 }
 
 
 bool CollisionHook::SDK_OnLoad( char *error, size_t maxlength, bool late )
 {
+	void *pPassServerEntityFilterAddr = NULL;
+
 	char szConfError[ 256 ] = "";
 	if ( !gameconfs->LoadGameConfigFile( "collisionhook", &g_pGameConf, szConfError, sizeof( szConfError ) ) )
 	{
@@ -89,16 +82,14 @@ bool CollisionHook::SDK_OnLoad( char *error, size_t maxlength, bool late )
 		return false;
 	}
 
-	CDetourManager::Init( g_pSM->GetScriptingEngine(), g_pGameConf );
-
-	g_pFilterDetour = DETOUR_CREATE_STATIC( PassServerEntityFilterFunc, "PassServerEntityFilter" );
-	if ( !g_pFilterDetour )
-	{
-		V_snprintf( error, maxlength, "Unable to hook PassServerEntityFilter!" );
+	if (!g_pGameConf->GetMemSig("PassServerEntityFilter", &pPassServerEntityFilterAddr) || pPassServerEntityFilterAddr == nullptr) {
+		g_pSM->LogError(myself, "Failed to retrieve PassServerEntityFilter.");
 		return false;
 	}
 
-	g_pFilterDetour->EnableDetour();
+	g_PassServerEntityFilterFuncDetour.Configure(reinterpret_cast<bool (*)(const IHandleEntity*, const IHandleEntity*)>(pPassServerEntityFilterAddr));
+	gPassServerEntityFilterDetoured = true;
+
 
 	g_pCollisionFwd = forwards->CreateForward( "CH_ShouldCollide", ET_Hook, 3, NULL, Param_Cell, Param_Cell, Param_CellByRef );
 	g_pPassFwd = forwards->CreateForward( "CH_PassFilter", ET_Hook, 3, NULL, Param_Cell, Param_Cell, Param_CellByRef );
@@ -115,10 +106,10 @@ void CollisionHook::SDK_OnUnload()
 
 	gameconfs->CloseGameConfigFile( g_pGameConf );
 
-	if ( g_pFilterDetour )
+	if ( gPassServerEntityFilterDetoured )
 	{
-		g_pFilterDetour->Destroy();
-		g_pFilterDetour = NULL;
+		g_PassServerEntityFilterFuncDetour.~Function();
+		gPassServerEntityFilterDetoured = false;
 	}
 }
 
@@ -126,76 +117,94 @@ bool CollisionHook::SDK_OnMetamodLoad( ISmmAPI *ismm, char *error, size_t maxlen
 {
 	GET_V_IFACE_CURRENT( GetPhysicsFactory, g_pPhysics, IPhysics, VPHYSICS_INTERFACE_VERSION );
 
-	SH_ADD_HOOK( IPhysics, CreateEnvironment, g_pPhysics, SH_MEMBER( this, &CollisionHook::CreateEnvironment ), true );
+
+	m_CreateEnvironment.Add(g_pPhysics);
 
 	return true;
 }
 
 bool CollisionHook::SDK_OnMetamodUnload(char *error, size_t maxlength)
 {
-	SH_REMOVE_HOOK( IPhysics, CreateEnvironment, g_pPhysics, SH_MEMBER( this, &CollisionHook::CreateEnvironment ), true );
-	SH_REMOVE_HOOK_ID( gSetCollisionSolverHookId );
-	SH_REMOVE_HOOK_ID( gShouldCollideHookId );
+	m_CreateEnvironment.Remove(g_pPhysics);
+
+	delete g_SetCollisionSolverHook;
+	delete g_ShouldCollideHook;
 
 	g_pPhysics = NULL;
-	gSetCollisionSolverHookId = gShouldCollideHookId = 0;
 
 	return true;
 }
 
 
-IPhysicsEnvironment *CollisionHook::CreateEnvironment()
+KHook::Return<IPhysicsEnvironment*> CollisionHook::CreateEnvironment(IPhysics *pPhysics)
 {
 	// in order to hook IPhysicsCollisionSolver::ShouldCollide, we need to know when a solver is installed
 	// in order to hook any installed solvers, we need to hook any created physics environments
 
-	IPhysicsEnvironment *pEnvironment = META_RESULT_ORIG_RET( IPhysicsEnvironment * );
+	IPhysicsEnvironment *pEnvironment = *(IPhysicsEnvironment **)KHook::GetCurrentValuePtr();
 
 	if ( !pEnvironment )
-		RETURN_META_VALUE( MRES_SUPERCEDE, pEnvironment ); // just in case
+		return { KHook::Action::Supersede, pEnvironment }; // just in case
+
+	void** vtable = *(void***)pEnvironment;
+	auto func = KHook::GetVtableFunction(pEnvironment, &IPhysicsEnvironment::SetCollisionSolver);
+
 
 	// Hook globally so we know when any solver is installed
-	gSetCollisionSolverHookId = SH_ADD_VPHOOK( IPhysicsEnvironment, SetCollisionSolver, pEnvironment,
-		SH_MEMBER( this, &CollisionHook::SetCollisionSolver ), true );
+	g_ShouldCollideHook = new CVTableHook(vtable,
+		new KHook::Member<IPhysicsEnvironment, void, IPhysicsCollisionSolver*>(
+			func,
+			this, nullptr, &CollisionHook::SetCollisionSolver
+		));
 	
-	SH_REMOVE_HOOK( IPhysics, CreateEnvironment, g_pPhysics,
-		SH_MEMBER( this, &CollisionHook::CreateEnvironment ), true ); // No longer needed
-
-	RETURN_META_VALUE( MRES_SUPERCEDE, pEnvironment );
+	m_CreateEnvironment.Remove(g_pPhysics);
+	return { KHook::Action::Supersede, pEnvironment };
 }
 
-void CollisionHook::SetCollisionSolver( IPhysicsCollisionSolver *pSolver )
+KHook::Return<void> CollisionHook::SetCollisionSolver( IPhysicsEnvironment *pEnvironment, IPhysicsCollisionSolver *pSolver )
 {
 	if ( !pSolver )
-		RETURN_META( MRES_IGNORED ); // this shouldn't happen, but knowing valve...
+		return { KHook::Action::Ignore }; // this shouldn't happen, but knowing valve...
+
+	void** vtable = *(void***)pSolver;
+	auto func = KHook::GetVtableFunction(pSolver, &IPhysicsCollisionSolver::ShouldCollide);
 
 	// The game installed a solver, globally hook ShouldCollide
-	gShouldCollideHookId = SH_ADD_VPHOOK( IPhysicsCollisionSolver, ShouldCollide, pSolver,
-		SH_MEMBER( this, &CollisionHook::VPhysics_ShouldCollide ), false );
+	#if SOURCE_ENGINE == SE_LEFT4DEAD2
+	g_ShouldCollideHook = new CVTableHook(vtable,
+		new KHook::Member<IPhysicsCollisionSolver, int, IPhysicsObject*, IPhysicsObject*, void*, void*, const PhysicsCollisionRulesCache_t &, const PhysicsCollisionRulesCache_t &>(
+			func,
+			this, &CollisionHook::VPhysics_ShouldCollide, nullptr
+		));
+	#else
+	g_ShouldCollideHook = new CVTableHook(vtable,
+		new KHook::Member<IPhysicsCollisionSolver, int, IPhysicsObject*, IPhysicsObject*, void*, void*>(
+			func,
+			this, &CollisionHook::VPhysics_ShouldCollide, nullptr
+		));
+	#endif
+	delete g_SetCollisionSolverHook; // No longer needed
 
-	SH_REMOVE_HOOK_ID( gSetCollisionSolverHookId ); // No longer needed
-	gSetCollisionSolverHookId = 0;
-
-	RETURN_META( MRES_IGNORED );
+	return { KHook::Action::Ignore };
 }
 
 #if SOURCE_ENGINE == SE_LEFT4DEAD2
-int CollisionHook::VPhysics_ShouldCollide( IPhysicsObject *pObj1, IPhysicsObject *pObj2, void *pGameData1, void *pGameData2, const PhysicsCollisionRulesCache_t &objCache1, const PhysicsCollisionRulesCache_t &obhCache2 )
+KHook::Return<int> CollisionHook::VPhysics_ShouldCollide( IPhysicsCollisionSolver* pSolver, IPhysicsObject *pObj1, IPhysicsObject *pObj2, void *pGameData1, void *pGameData2, const PhysicsCollisionRulesCache_t &objCache1, const PhysicsCollisionRulesCache_t &obhCache2 )
 #else
-int CollisionHook::VPhysics_ShouldCollide( IPhysicsObject *pObj1, IPhysicsObject *pObj2, void *pGameData1, void *pGameData2 )
+KHook::Return<int> CollisionHook::VPhysics_ShouldCollide( IPhysicsCollisionSolver* pSolver, IPhysicsObject *pObj1, IPhysicsObject *pObj2, void *pGameData1, void *pGameData2 )
 #endif
 {
 	if ( g_pCollisionFwd->GetFunctionCount() == 0 )
-		RETURN_META_VALUE( MRES_IGNORED, 1 ); // no plugins are interested, let the game decide
+		return { KHook::Action::Ignore, 1}; // no plugins are interested, let the game decide
 
 	if ( pObj1 == pObj2 )
-		RETURN_META_VALUE( MRES_IGNORED, 1 ); // self collisions aren't interesting
+		return { KHook::Action::Ignore, 1}; // self collisions aren't interesting
 
 	CBaseEntity *pEnt1 = reinterpret_cast<CBaseEntity *>( pGameData1 );
 	CBaseEntity *pEnt2 = reinterpret_cast<CBaseEntity *>( pGameData2 );
 
 	if ( !pEnt1 || !pEnt2 )
-		RETURN_META_VALUE( MRES_IGNORED, 1 ); // we need two entities
+		return { KHook::Action::Ignore, 1}; // we need two entities
 
 	cell_t ent1 = gamehelpers->EntityToBCompatRef( pEnt1 );
 	cell_t ent2 = gamehelpers->EntityToBCompatRef( pEnt2 );
@@ -212,9 +221,9 @@ int CollisionHook::VPhysics_ShouldCollide( IPhysicsObject *pObj1, IPhysicsObject
 	if ( retValue > Pl_Continue )
 	{
 		// plugin wants to change the result
-		RETURN_META_VALUE( MRES_SUPERCEDE, result == 1 );
+		return { KHook::Action::Supersede, result == 1 };
 	}
 
 	// otherwise, game decides
-	RETURN_META_VALUE( MRES_IGNORED, 0 );
+	return { KHook::Action::Ignore, 0 };
 }

@@ -18,7 +18,7 @@ class SDK(object):
 
         # By default, nothing supports x64.
         if type(platform) is list:
-            self.platformSpec = {p: ["x86"] for p in platform}
+            self.platformSpec = {p: ["x86", "x86_64"] for p in platform}
         else:
             self.platformSpec = platform
 
@@ -292,14 +292,19 @@ class ExtensionConfig(object):
             "-Wno-array-bounds",
             "-msse",
             "-fvisibility=hidden",
+            "-fPIC"
         ]
         cxx.cxxflags += [
-            "-std=c++14",
+            "-std=c++20",
             "-fno-threadsafe-statics",
             "-Wno-non-virtual-dtor",
             "-Wno-overloaded-virtual",
             "-fvisibility-inlines-hidden",
             "-fpermissive",
+            "-Wno-unknown-pragmas",
+            "-Wno-dangling-else",
+            "-Wno-deprecated-volatile",
+            "-Wno-macro-redefined",
         ]
 
         have_gcc = cxx.vendor == "gcc"
@@ -409,6 +414,7 @@ class ExtensionConfig(object):
             "i386",
             "-lstdc++",
             "-stdlib=libstdc++",
+            "-Wno-unknown-pragmas",
         ]
         cxx.cxxflags += ["-stdlib=libstdc++"]
 
@@ -433,7 +439,7 @@ class ExtensionConfig(object):
 
         compiler.cxxincludes += [
             os.path.join(self.mms_root, "core"),
-            os.path.join(self.mms_root, "core", "sourcehook"),
+            os.path.join(self.mms_root, 'third_party', 'khook', "include"),
         ]
 
         defines = ["RAD_TELEMETRY_DISABLED"]
